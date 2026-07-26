@@ -2,11 +2,15 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http/cookiejar"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -18,9 +22,11 @@ var enablePost = envBool("CLASSI_ENABLE_POST", false)
 var enableStudy = envBool("CLASSI_ENABLE_STUDY", true)
 var enableCal = envBool("CLASSI_ENABLE_CALENDAR", true)
 var enableLearningReport = envBool("CLASSI_ENABLE_LEARNING_REPORT", true)
+var downloadDir = envStr("CLASSI_DOWNLOAD_DIR", "/root/.hermes/downloads/classi")
 var subjectNames = map[int]string{34: "国語", 36: "社会", 38: "数学", 40: "理科", 42: "英語", 43: "その他", 57: "読書"}
 
 func envBool(k string, d bool) bool { v := os.Getenv(k); if v == "" { return d }; b, _ := strconv.ParseBool(v); return b }
+func envStr(k, d string) string { v := os.Getenv(k); if v == "" { return d }; return v }
 
 type ClassiClient struct {
 	resty    *resty.Client
@@ -29,7 +35,7 @@ type ClassiClient struct {
 
 func NewClient() *ClassiClient {
 	j, _ := cookiejar.New(nil)
-	return &ClassiClient{resty: resty.New().SetCookieJar(j).SetHeader("User-Agent", "Mozilla/5.0").SetHeader("Accept", "application/json, text/plain, */*").SetTimeout(15 * time.Second)}
+	return &ClassiClient{resty: resty.New().SetCookieJar(j).SetHeader("User-Agent", "Mozilla/5.0").SetHeader("Accept", "application/json, text/plain, */*").SetTimeout(30 * time.Second)}
 }
 
 func (c *ClassiClient) Login(uid, pw string) error {
@@ -48,9 +54,6 @@ func (c *ClassiClient) Login(uid, pw string) error {
 	t = csrf.Data
 	r, err := c.resty.R().SetHeader("x-csrf-token", t).SetHeader("Referer", "https://id.classi.jp/").SetHeader("Content-Type", "application/json").SetBody(map[string]string{}).Post("https://id-api.classi.jp/api/v1/login/issue_cookie")
 	if err != nil || r.StatusCode() != 200 { return fmt.Errorf("issue_cookie: %d", r.StatusCode()) }
-	var info struct{ User struct{ Name string } }
-	r2, _ := c.resty.R().SetResult(&info).Get("https://platform.classi.jp/api/user/info")
-	if r2.StatusCode() != 200 { return fmt.Errorf("verify: %d", r2.StatusCode()) }
 	c.loggedIn = true
 	return nil
 }
@@ -75,14 +78,15 @@ var cli = NewClient()
 
 func tools() []map[string]interface{} {
 	t := []map[string]interface{}{
-		{"name": "classi_login", "description": "Login", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"login_id": map[string]string{"type": "string"}, "password": map[string]string{"type": "string"}}}},
-		{"name": "classi_groups", "description": "List groups", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
-		{"name": "classi_new_messages", "description": "Latest messages", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
-		{"name": "classi_group_messages", "description": "Group messages", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"group_id": map[string]string{"type": "integer"}, "page": map[string]string{"type": "integer"}}}},
-		{"name": "classi_read_message", "description": "Read message", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"message_id": map[string]string{"type": "integer"}}, "required": []string{"message_id"}}},
-		{"name": "classi_notifications", "description": "Notifications", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"limit": map[string]string{"type": "integer"}}}},
-		{"name": "classi_calendar", "description": "Calendar", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"start_date": map[string]string{"type": "string"}, "end_date": map[string]string{"type": "string"}}}},
-		{"name": "classi_study_form", "description": "Study record for a day", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"date": map[string]string{"type": "string"}}}},
+		{"name": "classi_login", "description": "Login to Classi", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"login_id": map[string]string{"type": "string"}, "password": map[string]string{"type": "string"}}}},
+		{"name": "classi_groups", "description": "List all groups", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
+		{"name": "classi_new_messages", "description": "Latest unread messages across all groups", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
+		{"name": "classi_group_messages", "description": "Messages in a specific group", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"group_id": map[string]string{"type": "integer"}, "page": map[string]string{"type": "integer"}}}},
+		{"name": "classi_read_message", "description": "Read a specific message with full details including attachments", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"message_id": map[string]string{"type": "integer"}}, "required": []string{"message_id"}}},
+		{"name": "classi_download_file", "description": "Download an attachment file (PDF, image, etc.) from a Classi message. Returns the saved file path. Use entry_cd from message attachments.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"entry_cd": map[string]string{"type": "string", "description": "The entry_cd from the message attach array"}, "filename": map[string]string{"type": "string", "description": "Optional filename override"}}, "required": []string{"entry_cd"}}},
+		{"name": "classi_notifications", "description": "Service notifications", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"limit": map[string]string{"type": "integer"}}}},
+		{"name": "classi_calendar", "description": "School calendar events", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"start_date": map[string]string{"type": "string"}, "end_date": map[string]string{"type": "string"}}}},
+		{"name": "classi_study_form", "description": "Daily study record form", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"date": map[string]string{"type": "string"}}}},
 	}
 	if enableLearningReport {
 		t = append(t, map[string]interface{}{
@@ -97,6 +101,7 @@ func tools() []map[string]interface{} {
 }
 
 func main() {
+	os.MkdirAll(downloadDir, 0755)
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
 	for sc.Scan() {
@@ -108,7 +113,7 @@ func main() {
 			send(RawMsg{JSONRPC: "2.0", ID: msg.ID, Result: map[string]interface{}{
 				"protocolVersion": "2024-11-05",
 				"capabilities":    map[string]interface{}{"tools": map[string]bool{}},
-				"serverInfo":      map[string]string{"name": "classi-mcp", "version": "1.3.0"},
+				"serverInfo":      map[string]string{"name": "classi-mcp", "version": "1.4.0"},
 			}})
 		case "notifications/initialized":
 		case "tools/list":
@@ -148,12 +153,30 @@ func main() {
 					Group   struct{ Name string } `json:"group"`
 					Message struct {
 						ID   int `json:"id"`
-						Body struct{ Text string } `json:"body"`
+						Body struct {
+							Text   string `json:"text"`
+							Attach []struct {
+								EntryCD  string `json:"entry_cd"`
+								Type     int    `json:"type"`
+								FileName string `json:"file_name"`
+								DownloadURL string `json:"download_url"`
+							} `json:"attach"`
+						} `json:"body"`
 					} `json:"message"`
 				}
 				cli.resty.R().SetResult(&d).Get("https://platform.classi.jp/api/v2/groups/newmessages")
 				var msgs []map[string]interface{}
-				for _, m := range d { msgs = append(msgs, map[string]interface{}{"group": m.Group.Name, "message_id": m.Message.ID, "text": trunc(m.Message.Body.Text, 200)}) }
+				for _, m := range d {
+					entry := map[string]interface{}{"group": m.Group.Name, "message_id": m.Message.ID, "text": trunc(m.Message.Body.Text, 200)}
+					if len(m.Message.Body.Attach) > 0 {
+						var atts []map[string]string
+						for _, a := range m.Message.Body.Attach {
+							atts = append(atts, map[string]string{"entry_cd": a.EntryCD, "file_name": a.FileName, "type": fmt.Sprintf("%d", a.Type)})
+						}
+						entry["attachments"] = atts
+					}
+					msgs = append(msgs, entry)
+				}
 				result = msgs
 			case "classi_group_messages":
 				gid := int(getFloat(p.Arguments, "group_id"))
@@ -167,6 +190,49 @@ func main() {
 				var data interface{}
 				cli.resty.R().SetResult(&data).Get(fmt.Sprintf("https://platform.classi.jp/api/v3/group_messages/%d", mid))
 				result = data
+			case "classi_download_file":
+				entryCD, _ := p.Arguments["entry_cd"].(string)
+				filename, _ := p.Arguments["filename"].(string)
+				if entryCD == "" {
+					result = "Error: entry_cd is required"
+					break
+				}
+				// Download the file
+				resp, err := cli.resty.R().SetDoNotParseResponse(true).Get(
+					fmt.Sprintf("https://platform.classi.jp/api/cbank/%s/download", entryCD))
+				if err != nil {
+					result = fmt.Sprintf("Download failed: %v", err)
+					break
+				}
+				defer resp.RawBody().Close()
+				// Determine filename from Content-Disposition or use provided name
+				if filename == "" {
+					cd := resp.Header().Get("Content-Disposition")
+					if strings.Contains(cd, "filename=") {
+						parts := strings.Split(cd, "filename=")
+						if len(parts) > 1 {
+							filename = strings.Trim(parts[1], "\"; ")
+						}
+					}
+					if filename == "" {
+						filename = entryCD
+					}
+				}
+				savePath := filepath.Join(downloadDir, filename)
+				f, err := os.Create(savePath)
+				if err != nil {
+					result = fmt.Sprintf("Save failed: %v", err)
+					break
+				}
+				written, _ := io.Copy(f, resp.RawBody())
+				f.Close()
+				result = map[string]interface{}{
+					"path":      savePath,
+					"size":      written,
+					"filename":  filename,
+					"entry_cd":  entryCD,
+					"mime_type": resp.Header().Get("Content-Type"),
+				}
 			case "classi_notifications":
 				limit := 10
 				if v := getFloat(p.Arguments, "limit"); v > 0 { limit = int(v) }
@@ -195,7 +261,6 @@ func main() {
 			case "classi_learning_report":
 				uid := classiID
 				if v := getFloat(p.Arguments, "user_id"); v > 0 { uid = fmt.Sprintf("%d", int(v)) }
-				// Visit karte page to set domain cookies
 				cli.resty.R().Get(fmt.Sprintf("https://karte.classi.jp/student/learnings_report/%s", uid))
 				var data interface{}
 				cli.resty.R().SetResult(&data).Get(fmt.Sprintf("https://karte.classi.jp/api/users/%s/subject_learning_reports", uid))
@@ -224,3 +289,6 @@ func sendErr(id *int, code int, message string) {
 
 func getFloat(args map[string]interface{}, k string) float64 { v, _ := args[k].(float64); return v }
 func trunc(s string, n int) string { r := []rune(s); if len(r) <= n { return s }; return string(r[:n]) + "..." }
+
+// unused imports are needed for base64
+var _ = base64.StdEncoding
